@@ -28,7 +28,7 @@ import javax.crypto.spec.SecretKeySpec
  */
 object SessionCrypto {
 
-    const val PROTOCOL_VERSION: Byte = 0x03
+    const val PROTOCOL_VERSION: Byte = 0x04
     private const val CURVE = "secp256r1"
     private const val GCM_TAG_BITS = 128
     private const val GCM_NONCE_BYTES = 12

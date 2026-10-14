@@ -9,11 +9,11 @@ android {
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "tech.unyielded.offgrid.v3"
+        applicationId = "tech.unyielded.offgrid.v4"
         minSdk = 26
         targetSdk = 35
-        versionCode = 4
-        versionName = "0.3.1-v3"
+        versionCode = 5
+        versionName = "0.4.0-v4"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
