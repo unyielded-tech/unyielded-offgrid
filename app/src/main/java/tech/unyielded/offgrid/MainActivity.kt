@@ -412,7 +412,7 @@ class MainActivity : ComponentActivity() {
         ) {
             NavItem("Home", Icons.Default.Radar, Screen.HOME)
             NavItem("Discover", Icons.Default.Link, Screen.DISCOVERY)
-            NavItem("Contacts", Icons.Default.Contacts, Screen.CONTACTS)
+            NavItem("Contacts", Icons.Default.Person, Screen.CONTACTS)
             if (connected) {
                 NavItem("Chat", Icons.Default.Lock, Screen.CHAT)
             }

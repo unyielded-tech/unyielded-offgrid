@@ -33,7 +33,7 @@ object SessionCrypto {
     private const val GCM_TAG_BITS = 128
     private const val GCM_NONCE_BYTES = 12
     private const val SESSION_KEY_BYTES = 32
-    private const val MAX_PLAINTEXT_BYTES = 4096
+    private const val MAX_PLAINTEXT_BYTES = 250000
 
     private val secureRandom = SecureRandom()
 
