@@ -27,7 +27,7 @@ class IdentityManager(context: Context) {
         val fingerprint: String
     ) {
         val inviteCode: String
-            get() = "$shortId|$displayName"
+            get() = shortId + "|" + displayName
     }
 
     fun hasIdentity(): Boolean {
@@ -99,7 +99,7 @@ class IdentityManager(context: Context) {
     private fun deriveShortId(publicKey: ByteArray): String {
         val hash = MessageDigest.getInstance("SHA-256").digest(publicKey)
         val hex = hash.take(4).joinToString("") { "%02X".format(it) }
-        return "\( {hex.substring(0, 4)}- \){hex.substring(4, 8)}"
+        return hex.substring(0, 4) + "-" + hex.substring(4, 8)
     }
 
     private fun deriveFingerprint(publicKey: ByteArray): String {
