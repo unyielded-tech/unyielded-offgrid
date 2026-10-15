@@ -42,6 +42,8 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Call
+import androidx.compose.material.icons.filled.CallEnd
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.Lock
@@ -70,6 +72,8 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import tech.unyielded.offgrid.call.CallController
+import tech.unyielded.offgrid.call.CallProtocol
 import tech.unyielded.offgrid.identity.ContactStore
 import tech.unyielded.offgrid.identity.IdentityManager
 import tech.unyielded.offgrid.media.ImageCompressor
@@ -127,12 +131,14 @@ class MainActivity : ComponentActivity() {
     private var addContactCode by mutableStateOf("")
     private var meshPending by mutableStateOf(0)
     private var meshEvent by mutableStateOf("Mesh idle")
+    private var callState by mutableStateOf(CallController.State.IDLE)
 
     private var transport: BluetoothTransport? = null
     private var identityManager: IdentityManager? = null
     private var contactStore: ContactStore? = null
     private var voiceRecorder: VoiceRecorder? = null
     private var meshCoordinator: MeshCoordinator? = null
+    private var callController: CallController? = null
     private var pendingPermissionAction: (() -> Unit)? = null
 
     private val permissionLauncher =
@@ -184,12 +190,13 @@ class MainActivity : ComponentActivity() {
                 verified = false
                 messages.add(ChatMessage("Secure connection with $name", mine = false, system = true))
                 currentScreen = Screen.CHAT
-                // Start mesh relay handshake
-                meshCoordinator?.onConnected(null) { text ->
-                    transport?.sendMessage(text)
-                }
+                initCallController()
+                meshCoordinator?.onConnected(null) { text -> transport?.sendMessage(text) }
             }
             override fun onDisconnected(reason: String) {
+                callController?.release()
+                callController = null
+                callState = CallController.State.IDLE
                 connected = false
                 peerName = ""
                 fingerprint = ""
@@ -198,6 +205,9 @@ class MainActivity : ComponentActivity() {
                 messages.add(ChatMessage(reason, mine = false, system = true))
             }
             override fun onMessageReceived(text: String) {
+                if (callController?.onControlMessage(text) == true) {
+                    return
+                }
                 val handled = meshCoordinator?.onIncomingText(text, null) { reply ->
                     transport?.sendMessage(reply)
                 } == true
@@ -207,10 +217,17 @@ class MainActivity : ComponentActivity() {
                 refreshMeshUi()
             }
             override fun onMessageSent(text: String) {
-                messages.add(ChatMessage(text, mine = true))
+                if (!CallProtocol.isCallControl(text)) {
+                    messages.add(ChatMessage(text, mine = true))
+                }
             }
             override fun onVoiceReceived(bytes: ByteArray) {
-                messages.add(ChatMessage("Voice message", mine = false, isVoice = true, mediaBytes = bytes))
+                // During a call, voice frames are live audio
+                if (callState == CallController.State.IN_CALL) {
+                    callController?.onAudioReceived(bytes)
+                } else {
+                    messages.add(ChatMessage("Voice message", mine = false, isVoice = true, mediaBytes = bytes))
+                }
             }
             override fun onImageReceived(bytes: ByteArray) {
                 messages.add(ChatMessage("Photo", mine = false, isImage = true, mediaBytes = bytes))
@@ -249,15 +266,23 @@ class MainActivity : ComponentActivity() {
                 status = msg
             }
             mesh.onDeliveredToMe = { fromId, bytes ->
-                val text = try {
-                    String(bytes, Charsets.UTF_8)
-                } catch (_: Exception) {
-                    "[mesh data]"
-                }
+                val text = try { String(bytes, Charsets.UTF_8) } catch (_: Exception) { "[mesh data]" }
                 messages.add(ChatMessage("[Mesh] $fromId: $text", mine = false))
             }
             refreshMeshUi()
         }
+    }
+
+    private fun initCallController() {
+        callController?.release()
+        callController = CallController(
+            sendControl = { transport?.sendMessage(it) },
+            sendAudio = { transport?.sendVoice(it) }
+        ).also { cc ->
+            cc.onStateChanged = { callState = it }
+            cc.onStatus = { status = it }
+        }
+        callState = CallController.State.IDLE
     }
 
     private fun refreshMeshUi() {
@@ -266,6 +291,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        callController?.release()
         voiceRecorder?.release()
         transport?.shutdown()
         super.onDestroy()
@@ -311,6 +337,10 @@ class MainActivity : ComponentActivity() {
         }
         Column(modifier = Modifier.fillMaxSize()) {
             TopBar()
+            // Incoming / in-call banner
+            if (callState == CallController.State.INCOMING || callState == CallController.State.OUTGOING || callState == CallController.State.IN_CALL) {
+                CallBanner()
+            }
             Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
                 AnimatedContent(
                     targetState = currentScreen,
@@ -338,9 +368,61 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
+    private fun CallBanner() {
+        val bg = when (callState) {
+            CallController.State.INCOMING -> OffgridColors.Accent
+            CallController.State.OUTGOING -> OffgridColors.SurfaceElevated
+            CallController.State.IN_CALL -> OffgridColors.Danger
+            else -> OffgridColors.Surface
+        }
+        Row(
+            Modifier.fillMaxWidth().background(bg).padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Text(
+                when (callState) {
+                    CallController.State.INCOMING -> "Incoming call from $peerName"
+                    CallController.State.OUTGOING -> "Calling $peerName…"
+                    CallController.State.IN_CALL -> "In call with $peerName"
+                    else -> ""
+                },
+                color = OffgridColors.Ink,
+                fontWeight = FontWeight.Bold,
+                fontSize = 14.sp,
+                modifier = Modifier.weight(1f)
+            )
+            when (callState) {
+                CallController.State.INCOMING -> {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Box(
+                            Modifier.clip(RoundedCornerShape(8.dp)).background(OffgridColors.Ink)
+                                .clickable { callController?.acceptIncoming() }
+                                .padding(horizontal = 12.dp, vertical = 8.dp)
+                        ) { Text("Accept", color = OffgridColors.Accent, fontWeight = FontWeight.Bold, fontSize = 12.sp) }
+                        Box(
+                            Modifier.clip(RoundedCornerShape(8.dp)).background(OffgridColors.Ink)
+                                .clickable { callController?.rejectIncoming() }
+                                .padding(horizontal = 12.dp, vertical = 8.dp)
+                        ) { Text("Reject", color = OffgridColors.Danger, fontWeight = FontWeight.Bold, fontSize = 12.sp) }
+                    }
+                }
+                CallController.State.OUTGOING, CallController.State.IN_CALL -> {
+                    Box(
+                        Modifier.clip(RoundedCornerShape(8.dp)).background(OffgridColors.Ink)
+                            .clickable { callController?.endCall() }
+                            .padding(horizontal = 12.dp, vertical = 8.dp)
+                    ) { Text("End", color = OffgridColors.Danger, fontWeight = FontWeight.Bold, fontSize = 12.sp) }
+                }
+                else -> {}
+            }
+        }
+    }
+
+    @Composable
     private fun SetupScreen() {
         Column(
-            modifier = Modifier.fillMaxSize().padding(24.dp).verticalScroll(rememberScrollState()),
+            Modifier.fillMaxSize().padding(24.dp).verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.Center,
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
@@ -383,8 +465,8 @@ class MainActivity : ComponentActivity() {
                 },
                 enabled = setupName.trim().isNotBlank()
             )
-            Spacer(Modifier.height(12.dp))
-            Text("Your unique ID is generated on this phone.\nNo account. No server. Fully offline.", color = OffgridColors.TextTertiary, fontSize = 12.sp, textAlign = TextAlign.Center)
+            Spacer(Modifier.height(16.dp))
+            Text("Built by Ayaz · UNYIELDED", color = OffgridColors.TextTertiary, fontSize = 12.sp)
         }
     }
 
@@ -458,7 +540,6 @@ class MainActivity : ComponentActivity() {
                     Text("You are $myDisplayName  •  $myShortId", color = OffgridColors.TextSecondary, fontSize = 13.sp)
                 }
             }
-
             OffgridCard {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
@@ -474,17 +555,15 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             }
-
             if (meshPending > 0 || meshEvent != "Mesh idle") {
                 OffgridCard {
                     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        Text("Nearby mesh queue: $meshPending pending", color = OffgridColors.Accent, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                        Text("Mesh queue: $meshPending pending", color = OffgridColors.Accent, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                         Text(meshEvent, color = OffgridColors.TextSecondary, fontSize = 12.sp)
-                        Text("Multi-hop only works when phones are nearby. Not long-distance.", color = OffgridColors.TextTertiary, fontSize = 11.sp)
+                        Text("Nearby multi-hop only. Not long-distance.", color = OffgridColors.TextTertiary, fontSize = 11.sp)
                     }
                 }
             }
-
             SectionLabel("Quick Actions")
             PrimaryButton(
                 text = if (listening) "WAITING FOR PEER…" else "HOST / WAIT FOR PHONE",
@@ -503,7 +582,7 @@ class MainActivity : ComponentActivity() {
                 PrimaryButton(text = "OPEN CHAT", onClick = { currentScreen = Screen.CHAT })
                 SecondaryButton(text = "DISCONNECT", onClick = { transport?.disconnect() })
             }
-            Text("V5  •  MESH  •  IDENTITY  •  VOICE  •  PHOTOS  •  AES-256-GCM", color = OffgridColors.TextTertiary, fontSize = 9.sp, letterSpacing = 0.8.sp, modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center)
+            Text("Built by Ayaz · UNYIELDED  •  V6 Call", color = OffgridColors.TextTertiary, fontSize = 10.sp, modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center)
         }
     }
 
@@ -594,7 +673,7 @@ class MainActivity : ComponentActivity() {
                 if (messages.isEmpty()) {
                     item {
                         Text(
-                            "Encrypted chat ready.\nHold mic for voice • Tap image for photo",
+                            "Encrypted chat ready.\nHold mic for voice • Tap phone for call • Image for photo",
                             color = OffgridColors.TextTertiary,
                             fontSize = 13.sp,
                             textAlign = TextAlign.Center,
@@ -638,21 +717,25 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
+            // Composer with Call button
             Row(
                 Modifier.fillMaxWidth().background(OffgridColors.Surface).border(1.dp, OffgridColors.Border).padding(10.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                IconButton(onClick = { if (connected) imagePicker.launch("image/*") }, enabled = connected) {
+                // Photo
+                IconButton(onClick = { if (connected) imagePicker.launch("image/*") }, enabled = connected && callState == CallController.State.IDLE) {
                     Icon(Icons.Default.Image, "Photo", tint = if (connected) OffgridColors.Accent else OffgridColors.TextTertiary)
                 }
+
+                // Mic (voice message)
                 Box(
                     Modifier.size(42.dp).clip(CircleShape)
                         .background(if (isRecording) OffgridColors.Danger else OffgridColors.SurfaceElevated)
-                        .pointerInput(connected) {
+                        .pointerInput(connected, callState) {
                             detectTapGestures(
                                 onPress = {
-                                    if (!connected) return@detectTapGestures
+                                    if (!connected || callState != CallController.State.IDLE) return@detectTapGestures
                                     if (voiceRecorder?.startRecording() == true) {
                                         isRecording = true
                                         status = "Recording…"
@@ -676,6 +759,31 @@ class MainActivity : ComponentActivity() {
                         modifier = Modifier.size(22.dp)
                     )
                 }
+
+                // CALL BUTTON
+                IconButton(
+                    onClick = {
+                        if (!connected) return@IconButton
+                        when (callState) {
+                            CallController.State.IDLE -> callController?.startOutgoing()
+                            CallController.State.OUTGOING, CallController.State.IN_CALL -> callController?.endCall()
+                            else -> {}
+                        }
+                    },
+                    enabled = connected
+                ) {
+                    Icon(
+                        imageVector = if (callState == CallController.State.IDLE) Icons.Default.Call else Icons.Default.CallEnd,
+                        contentDescription = "Call",
+                        tint = when {
+                            !connected -> OffgridColors.TextTertiary
+                            callState == CallController.State.IN_CALL -> OffgridColors.Danger
+                            callState == CallController.State.OUTGOING -> OffgridColors.Accent
+                            else -> OffgridColors.Accent
+                        }
+                    )
+                }
+
                 Box(
                     Modifier.weight(1f).clip(RoundedCornerShape(12.dp)).background(OffgridColors.Ink)
                         .border(1.dp, OffgridColors.Border, RoundedCornerShape(12.dp))
@@ -685,7 +793,7 @@ class MainActivity : ComponentActivity() {
                     BasicTextField(
                         value = draft,
                         onValueChange = { draft = it },
-                        enabled = connected,
+                        enabled = connected && callState == CallController.State.IDLE,
                         modifier = Modifier.fillMaxWidth(),
                         textStyle = TextStyle(color = OffgridColors.TextPrimary, fontSize = 14.sp),
                         cursorBrush = SolidColor(OffgridColors.Accent),
@@ -694,8 +802,8 @@ class MainActivity : ComponentActivity() {
                 }
                 Box(
                     Modifier.clip(RoundedCornerShape(12.dp))
-                        .background(if (connected && draft.isNotBlank()) OffgridColors.Accent else OffgridColors.SurfaceElevated)
-                        .clickable(enabled = connected && draft.isNotBlank()) {
+                        .background(if (connected && draft.isNotBlank() && callState == CallController.State.IDLE) OffgridColors.Accent else OffgridColors.SurfaceElevated)
+                        .clickable(enabled = connected && draft.isNotBlank() && callState == CallController.State.IDLE) {
                             val text = draft.trim()
                             if (text.isNotEmpty()) {
                                 draft = ""
@@ -786,11 +894,13 @@ class MainActivity : ComponentActivity() {
             OffgridCard {
                 Text("$myShortId|$myDisplayName", color = OffgridColors.Accent, fontSize = 14.sp, fontWeight = FontWeight.Medium)
             }
-            SectionLabel("Mesh")
+            SectionLabel("About")
             OffgridCard {
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text("Pending messages: $meshPending", color = OffgridColors.TextPrimary, fontSize = 13.sp)
-                    Text("Nearby multi-hop only. Max 4 hops. 24h TTL.", color = OffgridColors.TextTertiary, fontSize = 12.sp)
+                    Text("UNYIELDED // OFFGRID", color = OffgridColors.TextPrimary, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                    Text("Built by Ayaz · UNYIELDED", color = OffgridColors.Accent, fontSize = 13.sp)
+                    Text("Private offline chat, mesh relay, experimental calling.", color = OffgridColors.TextSecondary, fontSize = 12.sp)
+                    Text("Version 0.6.0-v6", color = OffgridColors.TextTertiary, fontSize = 11.sp)
                 }
             }
         }
@@ -809,7 +919,7 @@ class MainActivity : ComponentActivity() {
                 Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     SecurityRow("Status", if (connected) "Connected" else "Disconnected")
                     SecurityRow("Encryption", if (connected) "AES-256-GCM" else "—")
-                    SecurityRow("Protocol", "OFFGRID V5")
+                    SecurityRow("Protocol", "OFFGRID V6")
                 }
             }
             if (connected && fingerprint.isNotEmpty()) {
