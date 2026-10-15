@@ -1,4 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">UNYIELDED // OFFGRID</string>
+    <string name="brand_tagline">Built by Ayaz · UNYIELDED</string>
+    <string name="brand_about">Private offline communication.\nMade by Ayaz under UNYIELDED.</string>
 </resources>
