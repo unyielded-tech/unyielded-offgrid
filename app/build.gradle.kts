@@ -12,8 +12,8 @@ android {
         applicationId = "tech.unyielded.offgrid.v4"
         minSdk = 26
         targetSdk = 35
-        versionCode = 5
-        versionName = "0.4.0-v4"
+        versionCode = 6
+        versionName = "0.5.0-v5"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
