@@ -42,16 +42,12 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.Contacts
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Radar
-import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -62,7 +58,6 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -79,6 +74,8 @@ import tech.unyielded.offgrid.identity.ContactStore
 import tech.unyielded.offgrid.identity.IdentityManager
 import tech.unyielded.offgrid.media.ImageCompressor
 import tech.unyielded.offgrid.media.VoiceRecorder
+import tech.unyielded.offgrid.mesh.MeshCoordinator
+import tech.unyielded.offgrid.mesh.MeshStatus
 import tech.unyielded.offgrid.transport.BluetoothTransport
 import tech.unyielded.offgrid.ui.DeviceCard
 import tech.unyielded.offgrid.ui.FingerprintDisplay
@@ -103,7 +100,7 @@ private data class ChatMessage(
 )
 
 private enum class Screen {
-    SETUP, HOME, DISCOVERY, CHAT, SECURITY, CONTACTS, PROFILE, SETTINGS
+    SETUP, HOME, DISCOVERY, CHAT, SECURITY, CONTACTS, PROFILE
 }
 
 class MainActivity : ComponentActivity() {
@@ -128,11 +125,14 @@ class MainActivity : ComponentActivity() {
     private var myFingerprint by mutableStateOf("")
     private var isRecording by mutableStateOf(false)
     private var addContactCode by mutableStateOf("")
+    private var meshPending by mutableStateOf(0)
+    private var meshEvent by mutableStateOf("Mesh idle")
 
     private var transport: BluetoothTransport? = null
     private var identityManager: IdentityManager? = null
     private var contactStore: ContactStore? = null
     private var voiceRecorder: VoiceRecorder? = null
+    private var meshCoordinator: MeshCoordinator? = null
     private var pendingPermissionAction: (() -> Unit)? = null
 
     private val permissionLauncher =
@@ -160,6 +160,7 @@ class MainActivity : ComponentActivity() {
             myDisplayName = identity.displayName
             myFingerprint = identity.fingerprint
             currentScreen = Screen.HOME
+            initMesh(identity.shortId)
         } else {
             currentScreen = Screen.SETUP
         }
@@ -183,6 +184,10 @@ class MainActivity : ComponentActivity() {
                 verified = false
                 messages.add(ChatMessage("Secure connection with $name", mine = false, system = true))
                 currentScreen = Screen.CHAT
+                // Start mesh relay handshake
+                meshCoordinator?.onConnected(null) { text ->
+                    transport?.sendMessage(text)
+                }
             }
             override fun onDisconnected(reason: String) {
                 connected = false
@@ -193,7 +198,13 @@ class MainActivity : ComponentActivity() {
                 messages.add(ChatMessage(reason, mine = false, system = true))
             }
             override fun onMessageReceived(text: String) {
-                messages.add(ChatMessage(text, mine = false))
+                val handled = meshCoordinator?.onIncomingText(text, null) { reply ->
+                    transport?.sendMessage(reply)
+                } == true
+                if (!handled) {
+                    messages.add(ChatMessage(text, mine = false))
+                }
+                refreshMeshUi()
             }
             override fun onMessageSent(text: String) {
                 messages.add(ChatMessage(text, mine = true))
@@ -206,8 +217,8 @@ class MainActivity : ComponentActivity() {
             }
             override fun onPeerIdentity(shortId: String, displayName: String) {
                 peerName = displayName
-                messages.add(ChatMessage("Peer identity: $displayName ($shortId)", mine = false, system = true))
-                contactStore?.find(shortId) ?: run {
+                messages.add(ChatMessage("Peer: $displayName ($shortId)", mine = false, system = true))
+                if (contactStore?.find(shortId) == null) {
                     contactStore?.add(ContactStore.Contact(shortId, displayName))
                     contacts.clear()
                     contacts.addAll(contactStore?.getAll() ?: emptyList())
@@ -217,9 +228,7 @@ class MainActivity : ComponentActivity() {
             override fun onHandshakeProgress(step: String) { status = step }
         })
 
-        identity?.let {
-            transport?.setMyIdentity(it.shortId, it.displayName)
-        }
+        identity?.let { transport?.setMyIdentity(it.shortId, it.displayName) }
 
         setContent {
             MaterialTheme(colorScheme = OffgridDarkScheme) {
@@ -228,6 +237,32 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    private fun initMesh(shortId: String) {
+        meshCoordinator = MeshCoordinator(this, shortId).also { mesh ->
+            mesh.onStatus = { msg ->
+                MeshStatus.lastEvent = msg
+                MeshStatus.pendingCount = mesh.pendingCount()
+                meshEvent = msg
+                meshPending = mesh.pendingCount()
+                status = msg
+            }
+            mesh.onDeliveredToMe = { fromId, bytes ->
+                val text = try {
+                    String(bytes, Charsets.UTF_8)
+                } catch (_: Exception) {
+                    "[mesh data]"
+                }
+                messages.add(ChatMessage("[Mesh] $fromId: $text", mine = false))
+            }
+            refreshMeshUi()
+        }
+    }
+
+    private fun refreshMeshUi() {
+        meshPending = meshCoordinator?.pendingCount() ?: 0
+        meshEvent = MeshStatus.lastEvent
     }
 
     override fun onDestroy() {
@@ -274,7 +309,6 @@ class MainActivity : ComponentActivity() {
             SetupScreen()
             return
         }
-
         Column(modifier = Modifier.fillMaxSize()) {
             TopBar()
             Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
@@ -282,7 +316,7 @@ class MainActivity : ComponentActivity() {
                     targetState = currentScreen,
                     transitionSpec = {
                         (slideInHorizontally { it / 4 } + fadeIn()) togetherWith
-                                (slideOutHorizontally { -it / 4 } + fadeOut())
+                            (slideOutHorizontally { -it / 4 } + fadeOut())
                     },
                     label = "screen"
                 ) { screen ->
@@ -293,7 +327,6 @@ class MainActivity : ComponentActivity() {
                         Screen.SECURITY -> SecurityScreen()
                         Screen.CONTACTS -> ContactsScreen()
                         Screen.PROFILE -> ProfileScreen()
-                        Screen.SETTINGS -> SettingsScreen()
                         Screen.SETUP -> SetupScreen()
                     }
                 }
@@ -307,10 +340,7 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun SetupScreen() {
         Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(24.dp)
-                .verticalScroll(rememberScrollState()),
+            modifier = Modifier.fillMaxSize().padding(24.dp).verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.Center,
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
@@ -319,21 +349,14 @@ class MainActivity : ComponentActivity() {
             Spacer(Modifier.height(8.dp))
             Text("Create your offline identity", color = OffgridColors.TextSecondary, fontSize = 14.sp)
             Spacer(Modifier.height(32.dp))
-
             OffgridCard {
                 Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     Text("Display Name", color = OffgridColors.TextSecondary, fontSize = 12.sp)
                     Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(12.dp))
-                            .background(OffgridColors.Ink)
-                            .border(1.dp, OffgridColors.Border, RoundedCornerShape(12.dp))
-                            .padding(14.dp)
+                        Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(OffgridColors.Ink)
+                            .border(1.dp, OffgridColors.Border, RoundedCornerShape(12.dp)).padding(14.dp)
                     ) {
-                        if (setupName.isEmpty()) {
-                            Text("Your name…", color = OffgridColors.TextTertiary)
-                        }
+                        if (setupName.isEmpty()) Text("Your name…", color = OffgridColors.TextTertiary)
                         BasicTextField(
                             value = setupName,
                             onValueChange = { setupName = it.take(32) },
@@ -344,7 +367,6 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             }
-
             Spacer(Modifier.height(20.dp))
             PrimaryButton(
                 text = "CREATE IDENTITY",
@@ -355,25 +377,21 @@ class MainActivity : ComponentActivity() {
                         myDisplayName = id.displayName
                         myFingerprint = id.fingerprint
                         transport?.setMyIdentity(id.shortId, id.displayName)
+                        initMesh(id.shortId)
                         currentScreen = Screen.HOME
                     }
                 },
                 enabled = setupName.trim().isNotBlank()
             )
             Spacer(Modifier.height(12.dp))
-            Text(
-                "Your unique ID is generated on this phone.\nNo account. No server. Fully offline.",
-                color = OffgridColors.TextTertiary,
-                fontSize = 12.sp,
-                textAlign = TextAlign.Center
-            )
+            Text("Your unique ID is generated on this phone.\nNo account. No server. Fully offline.", color = OffgridColors.TextTertiary, fontSize = 12.sp, textAlign = TextAlign.Center)
         }
     }
 
     @Composable
     private fun TopBar() {
         Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 16.dp),
+            Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 16.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             if (currentScreen != Screen.HOME) {
@@ -381,15 +399,13 @@ class MainActivity : ComponentActivity() {
                     Icon(Icons.AutoMirrored.Filled.ArrowBack, null, tint = OffgridColors.TextSecondary)
                 }
             }
-            Column(modifier = Modifier.weight(1f)) {
+            Column(Modifier.weight(1f)) {
                 Text("UNYIELDED", color = OffgridColors.Accent, fontSize = 11.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 3.sp)
                 Text("// OFFGRID", color = OffgridColors.TextPrimary, fontSize = 20.sp, fontWeight = FontWeight.Black)
             }
             Row(
                 verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier
-                    .clip(RoundedCornerShape(20.dp))
-                    .background(OffgridColors.Surface)
+                modifier = Modifier.clip(RoundedCornerShape(20.dp)).background(OffgridColors.Surface)
                     .border(1.dp, OffgridColors.Border, RoundedCornerShape(20.dp))
                     .padding(horizontal = 10.dp, vertical = 6.dp)
             ) {
@@ -403,19 +419,14 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun BottomNav() {
         Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(OffgridColors.Surface)
-                .border(1.dp, OffgridColors.Border)
+            Modifier.fillMaxWidth().background(OffgridColors.Surface).border(1.dp, OffgridColors.Border)
                 .padding(vertical = 10.dp, horizontal = 4.dp),
             horizontalArrangement = Arrangement.SpaceEvenly
         ) {
             NavItem("Home", Icons.Default.Radar, Screen.HOME)
             NavItem("Discover", Icons.Default.Link, Screen.DISCOVERY)
             NavItem("Contacts", Icons.Default.Person, Screen.CONTACTS)
-            if (connected) {
-                NavItem("Chat", Icons.Default.Lock, Screen.CHAT)
-            }
+            if (connected) NavItem("Chat", Icons.Default.Lock, Screen.CHAT)
             NavItem("Profile", Icons.Default.Person, Screen.PROFILE)
         }
     }
@@ -436,7 +447,8 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun HomeScreen() {
         Column(
-            modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = OffgridDimens.ScreenPadding).padding(bottom = 24.dp),
+            Modifier.fillMaxSize().verticalScroll(rememberScrollState())
+                .padding(horizontal = OffgridDimens.ScreenPadding).padding(bottom = 24.dp),
             verticalArrangement = Arrangement.spacedBy(18.dp)
         ) {
             OffgridCard {
@@ -463,6 +475,16 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
+            if (meshPending > 0 || meshEvent != "Mesh idle") {
+                OffgridCard {
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text("Nearby mesh queue: $meshPending pending", color = OffgridColors.Accent, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                        Text(meshEvent, color = OffgridColors.TextSecondary, fontSize = 12.sp)
+                        Text("Multi-hop only works when phones are nearby. Not long-distance.", color = OffgridColors.TextTertiary, fontSize = 11.sp)
+                    }
+                }
+            }
+
             SectionLabel("Quick Actions")
             PrimaryButton(
                 text = if (listening) "WAITING FOR PEER…" else "HOST / WAIT FOR PHONE",
@@ -481,19 +503,19 @@ class MainActivity : ComponentActivity() {
                 PrimaryButton(text = "OPEN CHAT", onClick = { currentScreen = Screen.CHAT })
                 SecondaryButton(text = "DISCONNECT", onClick = { transport?.disconnect() })
             }
-            Text("V4  •  IDENTITY  •  VOICE  •  PHOTOS  •  AES-256-GCM", color = OffgridColors.TextTertiary, fontSize = 9.sp, letterSpacing = 0.8.sp, modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center)
+            Text("V5  •  MESH  •  IDENTITY  •  VOICE  •  PHOTOS  •  AES-256-GCM", color = OffgridColors.TextTertiary, fontSize = 9.sp, letterSpacing = 0.8.sp, modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center)
         }
     }
 
     @Composable
     private fun DiscoveryScreen() {
-        Column(modifier = Modifier.fillMaxSize().padding(horizontal = OffgridDimens.ScreenPadding)) {
+        Column(Modifier.fillMaxSize().padding(horizontal = OffgridDimens.ScreenPadding)) {
             Spacer(Modifier.height(8.dp))
             SectionLabel("Nearby Devices")
             Spacer(Modifier.height(12.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
                 if (scanning) { ScanningIndicator(); Spacer(Modifier.width(8.dp)) }
-                Column(modifier = Modifier.weight(1f)) {
+                Column(Modifier.weight(1f)) {
                     Text(if (scanning) "Scanning…" else "Ready to scan", color = OffgridColors.TextPrimary, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
                     Text(status, color = OffgridColors.TextSecondary, fontSize = 12.sp)
                 }
@@ -512,7 +534,7 @@ class MainActivity : ComponentActivity() {
                     Column(Modifier.fillMaxWidth().padding(vertical = 24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                         Text("No devices yet", color = OffgridColors.TextPrimary, fontWeight = FontWeight.SemiBold)
                         Spacer(Modifier.height(6.dp))
-                        Text("Enable Bluetooth on both phones.\nOther phone may need to be discoverable.", color = OffgridColors.TextSecondary, fontSize = 13.sp, textAlign = TextAlign.Center)
+                        Text("Enable Bluetooth on both phones.", color = OffgridColors.TextSecondary, fontSize = 13.sp, textAlign = TextAlign.Center)
                     }
                 }
             } else {
@@ -547,74 +569,85 @@ class MainActivity : ComponentActivity() {
             if (messages.isNotEmpty()) listState.animateScrollToItem(messages.size - 1)
         }
 
-        Column(modifier = Modifier.fillMaxSize().imePadding()) {
+        Column(Modifier.fillMaxSize().imePadding()) {
             Column(Modifier.fillMaxWidth().background(OffgridColors.Surface).border(1.dp, OffgridColors.Border).padding(horizontal = 20.dp, vertical = 12.dp)) {
                 Text(if (connected) peerName else "Not connected", color = OffgridColors.TextPrimary, fontWeight = FontWeight.Bold, fontSize = 16.sp)
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     StatusDot(connected)
                     Spacer(Modifier.width(6.dp))
-                    Text(if (connected) { if (verified) "Verified • $fingerprint" else "Encrypted • $fingerprint" } else status, color = if (verified) OffgridColors.Accent else OffgridColors.TextSecondary, fontSize = 12.sp)
+                    Text(
+                        if (connected) {
+                            if (verified) "Verified • $fingerprint" else "Encrypted • $fingerprint"
+                        } else status,
+                        color = if (verified) OffgridColors.Accent else OffgridColors.TextSecondary,
+                        fontSize = 12.sp
+                    )
                 }
             }
 
-            LazyColumn(state = listState, modifier = Modifier.weight(1f).fillMaxWidth().padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(10.dp), contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 16.dp)) {
+            LazyColumn(
+                state = listState,
+                modifier = Modifier.weight(1f).fillMaxWidth().padding(horizontal = 16.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 16.dp)
+            ) {
                 if (messages.isEmpty()) {
                     item {
-                        Text("Encrypted chat ready.\nHold mic for voice • Tap image for photo", color = OffgridColors.TextTertiary, fontSize = 13.sp, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth().padding(top = 40.dp))
+                        Text(
+                            "Encrypted chat ready.\nHold mic for voice • Tap image for photo",
+                            color = OffgridColors.TextTertiary,
+                            fontSize = 13.sp,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier.fillMaxWidth().padding(top = 40.dp)
+                        )
                     }
                 }
                 items(messages) { msg ->
-                    if (msg.isVoice) {
-                        Row(Modifier.fillMaxWidth(), horizontalArrangement = if (msg.mine) Arrangement.End else Arrangement.Start) {
-                            Box(
-                                Modifier
-                                    .clip(RoundedCornerShape(14.dp))
-                                    .background(if (msg.mine) OffgridColors.BubbleMine else OffgridColors.BubblePeer)
-                                    .border(1.dp, if (msg.mine) OffgridColors.AccentMuted else OffgridColors.Border, RoundedCornerShape(14.dp))
-                                    .clickable { msg.mediaBytes?.let { voiceRecorder?.play(it) } }
-                                    .padding(horizontal = 14.dp, vertical = 10.dp)
-                            ) {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Icon(Icons.Default.Mic, null, tint = OffgridColors.Accent, modifier = Modifier.size(18.dp))
-                                    Spacer(Modifier.width(8.dp))
-                                    Text(if (msg.mine) "Voice (tap to play)" else "Voice (tap to play)", color = OffgridColors.TextPrimary, fontSize = 13.sp)
+                    when {
+                        msg.isVoice -> {
+                            Row(Modifier.fillMaxWidth(), horizontalArrangement = if (msg.mine) Arrangement.End else Arrangement.Start) {
+                                Box(
+                                    Modifier.clip(RoundedCornerShape(14.dp))
+                                        .background(if (msg.mine) OffgridColors.BubbleMine else OffgridColors.BubblePeer)
+                                        .border(1.dp, if (msg.mine) OffgridColors.AccentMuted else OffgridColors.Border, RoundedCornerShape(14.dp))
+                                        .clickable { msg.mediaBytes?.let { voiceRecorder?.play(it) } }
+                                        .padding(horizontal = 14.dp, vertical = 10.dp)
+                                ) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Icon(Icons.Default.Mic, null, tint = OffgridColors.Accent, modifier = Modifier.size(18.dp))
+                                        Spacer(Modifier.width(8.dp))
+                                        Text("Voice (tap to play)", color = OffgridColors.TextPrimary, fontSize = 13.sp)
+                                    }
                                 }
                             }
                         }
-                    } else if (msg.isImage) {
-                        Row(Modifier.fillMaxWidth(), horizontalArrangement = if (msg.mine) Arrangement.End else Arrangement.Start) {
-                            Box(
-                                Modifier
-                                    .clip(RoundedCornerShape(14.dp))
-                                    .background(if (msg.mine) OffgridColors.BubbleMine else OffgridColors.BubblePeer)
-                                    .border(1.dp, if (msg.mine) OffgridColors.AccentMuted else OffgridColors.Border, RoundedCornerShape(14.dp))
-                                    .padding(10.dp)
-                            ) {
-                                Text(if (msg.mine) "📷 Photo sent" else "📷 Photo received", color = OffgridColors.TextPrimary, fontSize = 13.sp)
+                        msg.isImage -> {
+                            Row(Modifier.fillMaxWidth(), horizontalArrangement = if (msg.mine) Arrangement.End else Arrangement.Start) {
+                                Box(
+                                    Modifier.clip(RoundedCornerShape(14.dp))
+                                        .background(if (msg.mine) OffgridColors.BubbleMine else OffgridColors.BubblePeer)
+                                        .border(1.dp, if (msg.mine) OffgridColors.AccentMuted else OffgridColors.Border, RoundedCornerShape(14.dp))
+                                        .padding(10.dp)
+                                ) {
+                                    Text(if (msg.mine) "Photo sent" else "Photo received", color = OffgridColors.TextPrimary, fontSize = 13.sp)
+                                }
                             }
                         }
-                    } else {
-                        MessageBubble(msg.text, msg.mine, msg.system)
+                        else -> MessageBubble(msg.text, msg.mine, msg.system)
                     }
                 }
             }
 
-            // Composer
             Row(
                 Modifier.fillMaxWidth().background(OffgridColors.Surface).border(1.dp, OffgridColors.Border).padding(10.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                // Image button
                 IconButton(onClick = { if (connected) imagePicker.launch("image/*") }, enabled = connected) {
                     Icon(Icons.Default.Image, "Photo", tint = if (connected) OffgridColors.Accent else OffgridColors.TextTertiary)
                 }
-
-                // Mic button (hold to record)
                 Box(
-                    Modifier
-                        .size(42.dp)
-                        .clip(CircleShape)
+                    Modifier.size(42.dp).clip(CircleShape)
                         .background(if (isRecording) OffgridColors.Danger else OffgridColors.SurfaceElevated)
                         .pointerInput(connected) {
                             detectTapGestures(
@@ -637,11 +670,16 @@ class MainActivity : ComponentActivity() {
                         },
                     contentAlignment = Alignment.Center
                 ) {
-                    Icon(Icons.Default.Mic, "Voice", tint = if (isRecording) OffgridColors.TextPrimary else if (connected) OffgridColors.Accent else OffgridColors.TextTertiary, modifier = Modifier.size(22.dp))
+                    Icon(
+                        Icons.Default.Mic, "Voice",
+                        tint = if (isRecording) OffgridColors.TextPrimary else if (connected) OffgridColors.Accent else OffgridColors.TextTertiary,
+                        modifier = Modifier.size(22.dp)
+                    )
                 }
-
                 Box(
-                    Modifier.weight(1f).clip(RoundedCornerShape(12.dp)).background(OffgridColors.Ink).border(1.dp, OffgridColors.Border, RoundedCornerShape(12.dp)).padding(horizontal = 12.dp, vertical = 10.dp)
+                    Modifier.weight(1f).clip(RoundedCornerShape(12.dp)).background(OffgridColors.Ink)
+                        .border(1.dp, OffgridColors.Border, RoundedCornerShape(12.dp))
+                        .padding(horizontal = 12.dp, vertical = 10.dp)
                 ) {
                     if (draft.isEmpty()) Text("Message…", color = OffgridColors.TextTertiary, fontSize = 14.sp)
                     BasicTextField(
@@ -654,10 +692,8 @@ class MainActivity : ComponentActivity() {
                         singleLine = true
                     )
                 }
-
                 Box(
-                    Modifier
-                        .clip(RoundedCornerShape(12.dp))
+                    Modifier.clip(RoundedCornerShape(12.dp))
                         .background(if (connected && draft.isNotBlank()) OffgridColors.Accent else OffgridColors.SurfaceElevated)
                         .clickable(enabled = connected && draft.isNotBlank()) {
                             val text = draft.trim()
@@ -680,11 +716,13 @@ class MainActivity : ComponentActivity() {
             Spacer(Modifier.height(8.dp))
             SectionLabel("Friends")
             Spacer(Modifier.height(12.dp))
-
             OffgridCard {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     Text("Add friend by invite code", color = OffgridColors.TextSecondary, fontSize = 12.sp)
-                    Box(Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(OffgridColors.Ink).border(1.dp, OffgridColors.Border, RoundedCornerShape(12.dp)).padding(12.dp)) {
+                    Box(
+                        Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(OffgridColors.Ink)
+                            .border(1.dp, OffgridColors.Border, RoundedCornerShape(12.dp)).padding(12.dp)
+                    ) {
                         if (addContactCode.isEmpty()) Text("A3F7-9C2B|Their Name", color = OffgridColors.TextTertiary, fontSize = 13.sp)
                         BasicTextField(
                             value = addContactCode,
@@ -708,24 +746,18 @@ class MainActivity : ComponentActivity() {
                     })
                 }
             }
-
             Spacer(Modifier.height(16.dp))
             if (contacts.isEmpty()) {
                 OffgridCard {
-                    Text("No contacts yet.\nShare your invite code from Profile, or add one above.", color = OffgridColors.TextSecondary, fontSize = 13.sp, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth().padding(vertical = 16.dp))
+                    Text("No contacts yet.\nShare your invite code from Profile.", color = OffgridColors.TextSecondary, fontSize = 13.sp, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth().padding(vertical = 16.dp))
                 }
             } else {
                 LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     items(contacts, key = { it.shortId }) { c ->
                         OffgridCard {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Column(Modifier.weight(1f)) {
-                                    Text(c.displayName, color = OffgridColors.TextPrimary, fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
-                                    Text(c.shortId, color = OffgridColors.TextTertiary, fontSize = 12.sp)
-                                }
-                                if (c.verified) {
-                                    Text("✓", color = OffgridColors.Accent, fontWeight = FontWeight.Bold)
-                                }
+                            Column {
+                                Text(c.displayName, color = OffgridColors.TextPrimary, fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
+                                Text(c.shortId, color = OffgridColors.TextTertiary, fontSize = 12.sp)
                             }
                         }
                     }
@@ -736,7 +768,11 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     private fun ProfileScreen() {
-        Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = OffgridDimens.ScreenPadding).padding(bottom = 24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        Column(
+            Modifier.fillMaxSize().verticalScroll(rememberScrollState())
+                .padding(horizontal = OffgridDimens.ScreenPadding).padding(bottom = 24.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
             Spacer(Modifier.height(4.dp))
             SectionLabel("Your Identity")
             OffgridCard {
@@ -747,16 +783,14 @@ class MainActivity : ComponentActivity() {
                 }
             }
             SectionLabel("Invite Code")
-            Text("Share this code so friends can add you offline.", color = OffgridColors.TextSecondary, fontSize = 13.sp)
             OffgridCard {
                 Text("$myShortId|$myDisplayName", color = OffgridColors.Accent, fontSize = 14.sp, fontWeight = FontWeight.Medium)
             }
-            SectionLabel("Security")
+            SectionLabel("Mesh")
             OffgridCard {
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text("• Long-term identity key stored only on this phone", color = OffgridColors.TextSecondary, fontSize = 12.sp)
-                    Text("• Session keys are ephemeral (ECDH + AES-256-GCM)", color = OffgridColors.TextSecondary, fontSize = 12.sp)
-                    Text("• Compare session fingerprints to detect MITM", color = OffgridColors.TextSecondary, fontSize = 12.sp)
+                    Text("Pending messages: $meshPending", color = OffgridColors.TextPrimary, fontSize = 13.sp)
+                    Text("Nearby multi-hop only. Max 4 hops. 24h TTL.", color = OffgridColors.TextTertiary, fontSize = 12.sp)
                 }
             }
         }
@@ -764,15 +798,18 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     private fun SecurityScreen() {
-        Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = OffgridDimens.ScreenPadding).padding(bottom = 24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        Column(
+            Modifier.fillMaxSize().verticalScroll(rememberScrollState())
+                .padding(horizontal = OffgridDimens.ScreenPadding).padding(bottom = 24.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
             Spacer(Modifier.height(4.dp))
             SectionLabel("Connection Security")
             OffgridCard {
                 Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     SecurityRow("Status", if (connected) "Connected" else "Disconnected")
                     SecurityRow("Encryption", if (connected) "AES-256-GCM" else "—")
-                    SecurityRow("Key Exchange", if (connected) "Ephemeral ECDH (P-256)" else "—")
-                    SecurityRow("Protocol", "OFFGRID V4")
+                    SecurityRow("Protocol", "OFFGRID V5")
                 }
             }
             if (connected && fingerprint.isNotEmpty()) {
@@ -780,14 +817,6 @@ class MainActivity : ComponentActivity() {
                 FingerprintDisplay(fingerprint)
                 if (!verified) {
                     PrimaryButton(text = "I VERIFIED THE FINGERPRINT", onClick = { verified = true })
-                } else {
-                    OffgridCard {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            StatusDot(true)
-                            Spacer(Modifier.width(10.dp))
-                            Text("Fingerprint verified by you", color = OffgridColors.Accent, fontWeight = FontWeight.SemiBold)
-                        }
-                    }
                 }
             }
         }
@@ -798,24 +827,6 @@ class MainActivity : ComponentActivity() {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
             Text(label, color = OffgridColors.TextSecondary, fontSize = 13.sp)
             Text(value, color = OffgridColors.TextPrimary, fontSize = 13.sp, fontWeight = FontWeight.Medium)
-        }
-    }
-
-    @Composable
-    private fun SettingsScreen() {
-        Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = OffgridDimens.ScreenPadding).padding(bottom = 24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-            Spacer(Modifier.height(4.dp))
-            SectionLabel("About")
-            OffgridCard {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("UNYIELDED // OFFGRID", color = OffgridColors.TextPrimary, fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                    Text("Version 0.4.0-v4", color = OffgridColors.TextSecondary, fontSize = 13.sp)
-                    Text("Identity • Voice • Photos • Offline encrypted chat", color = OffgridColors.TextSecondary, fontSize = 13.sp)
-                }
-            }
-            if (connected || listening) {
-                SecondaryButton(text = "DISCONNECT / RESET", onClick = { transport?.disconnect() })
-            }
         }
     }
 }
