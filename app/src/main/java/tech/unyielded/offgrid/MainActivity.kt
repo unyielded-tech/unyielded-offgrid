@@ -276,6 +276,7 @@ class MainActivity : ComponentActivity() {
     private fun initCallController() {
         callController?.release()
         callController = CallController(
+            this,
             sendControl = { transport?.sendMessage(it) },
             sendAudio = { transport?.sendVoice(it) }
         ).also { cc ->
